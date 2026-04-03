@@ -1,0 +1,246 @@
+# docker-compose.yml
+# Orchestrates the full MQTT → Kafka → Flink → Delta Lake pipeline
+
+
+services:
+
+  # ============================================================
+  # KAFKA - Distributed Event Streaming Platform
+  # ============================================================
+  # Purpose: Durable message queue between the MQTT bridge and Flink.
+  #          Unlike MQTT (fire-and-forget), Kafka stores messages on
+  #          disk so consumers can replay them.
+  #
+  # KRaft Mode:
+  #   Kafka traditionally needed Zookeeper (a separate service) for
+  #   coordination. Since Kafka 3.3+, KRaft mode handles this
+  #   internally — one fewer container to manage.
+  #
+  # Image: apache/kafka:3.9.0
+  #   - Official Apache Kafka image
+  #   - KRaft mode by default (no Zookeeper needed)
+  #
+  # Key environment variables explained:
+  #   PROCESS_ROLES=broker,controller
+  #     → This single node acts as both broker AND controller
+  #   LISTENERS
+  #     → PLAINTEXT: for data (producers/consumers connect here)
+  #     → CONTROLLER: for internal cluster management
+  # ============================================================
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    ports:
+      - "9092:9092"       # Kafka broker port (for producers/consumers)
+    environment:
+      # KRaft mode configuration (no Zookeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Listener configuration
+      # PLAINTEXT: for internal Docker network traffic (port 9092)
+      # CONTROLLER: for internal Kafka coordination (port 9093)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+      # Cluster ID (required for KRaft mode)
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+      # Auto-create topics when producers first write to them
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # Use only 1 replica (single-node setup)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
+  # ============================================================
+  # SENSOR SIMULATOR - Fake Data Generator
+  # ============================================================
+  # Purpose: Generates fake FDS and OBJ messages for testing.
+  #          Publishes to the local Mosquitto broker on this machine.
+  #
+  # network_mode: host
+  #   Instead of Docker's virtual network, this container uses the
+  #   host machine's network directly. This lets it connect to the
+  #   Mosquitto broker running on localhost:1883.
+  #
+  #   Trade-off: The container can't use Docker DNS names (like
+  #   "kafka"), but it doesn't need to — it only talks to Mosquitto.
+  # ============================================================
+  sensor-simulator:
+    build: ./src/sensor_simulator
+    container_name: sensor-simulator
+    network_mode: host
+    environment:
+      MQTT_BROKER: "192.168.29.44"
+      MQTT_PORT: "1883"
+      DEVICE_ID: "kc_sim_001"
+      LOCATION: "room1"
+      PUBLISH_INTERVAL: "0.5"
+      FALL_PROBABILITY: "0.02"
+    restart: unless-stopped
+
+  # ============================================================
+  # MQTT-KAFKA BRIDGE - Connects MQTT to Kafka
+  # ============================================================
+  # Purpose: Subscribes to MQTT topics and forwards messages to
+  #          Kafka topics. This is the "glue" between the IoT world
+  #          (MQTT) and the stream processing world (Kafka).
+  #
+  # Networking:
+  #   This container needs to reach BOTH:
+  #   - Mosquitto on the host (192.168.29.44:1883)
+  #   - Kafka on the Docker network (kafka:9092)
+  #
+  #   We use the "pipeline" network for Kafka access, and
+  #   extra_hosts to map "mqtt-host" to the host machine's IP
+  #   so it can reach Mosquitto.
+  #
+  # extra_hosts:
+  #   Adds an entry to the container's /etc/hosts file.
+  #   "host.docker.internal:host-gateway" maps that hostname
+  #   to the host machine's IP. This is the standard Docker way
+  #   to let containers reach host services.
+  # ============================================================
+  mqtt-kafka-bridge:
+    build: ./src/mqtt_kafka_bridge
+    container_name: mqtt-kafka-bridge
+    depends_on:
+      - kafka
+    environment:
+      MQTT_BROKER: "host.docker.internal"
+      MQTT_PORT: "1883"
+      KAFKA_BROKER: "kafka:9092"
+      MQTT_TOPICS: "fds,obj"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+  # ============================================================
+  # FLINK JOBMANAGER - The "Brain" of Flink
+  # ============================================================
+  # Purpose: Coordinates the Flink job. Manages:
+  #   - Job scheduling (which tasks run where)
+  #   - Checkpointing (saving state for fault tolerance)
+  #   - The Web UI (http://localhost:8081)
+  #
+  # Think of it like a project manager — it doesn't do the work
+  # itself, but it tells the TaskManagers what to do.
+  # ============================================================
+  flink-jobmanager:
+    build: ./src/flink_jobs
+    container_name: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"    # Flink Web UI
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+      KAFKA_BROKER: "kafka:9092"
+      DELTA_BASE_PATH: "/opt/flink/delta"
+      FLUSH_INTERVAL: "10"
+      FLUSH_SIZE: "100"
+    depends_on:
+      - kafka
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+  # ============================================================
+  # FLINK TASKMANAGER - The "Workers" of Flink
+  # ============================================================
+  # Purpose: Actually processes the data. TaskManagers run the
+  #   tasks assigned by the JobManager.
+  #
+  # In production you'd have multiple TaskManagers across machines.
+  # For our PoC, one is enough.
+  #
+  # taskmanager.numberOfTaskSlots: 4
+  #   Each slot can run one parallel pipeline. We only use 1 slot
+  #   (parallelism=1) but having 4 available is fine.
+  # ============================================================
+  flink-taskmanager:
+    build: ./src/flink_jobs
+    container_name: flink-taskmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+      KAFKA_BROKER: "kafka:9092"
+      DELTA_BASE_PATH: "/opt/flink/delta"
+      FLUSH_INTERVAL: "10"
+      FLUSH_SIZE: "100"
+    depends_on:
+      - flink-jobmanager
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
+  # ============================================================
+  # DELTA WRITER - Writes Kafka data to Delta Lake tables
+  # ============================================================
+  # Purpose: Reads processed data from Flink's output Kafka topics
+  #          and writes to Delta Lake tables on the local filesystem.
+  #
+  # Why separate from Flink?
+  #   PyFlink requires pyarrow < 10 (via apache-beam dependency)
+  #   deltalake requires pyarrow >= 16
+  #   They cannot coexist. This is a common pattern in production:
+  #   the stream processor handles logic, a separate writer handles storage.
+  #
+  # Volumes:
+  #   ./data/delta is mounted so Delta tables are accessible from
+  #   both inside the container and on the host machine.
+  # ============================================================
+  delta-writer:
+    build: ./src/delta_writer
+    container_name: delta-writer
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      DELTA_BASE_PATH: "/data/delta"
+      FLUSH_INTERVAL: "10"
+      FLUSH_SIZE: "100"
+    volumes:
+      - ./data/delta:/data/delta
+    depends_on:
+      - kafka
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
+# ============================================================
+# VOLUMES
+# ============================================================
+# Named volumes persist data across container restarts.
+# kafka_data: Stores Kafka's commit log (the actual messages).
+#             Without this, restarting Kafka would lose all data.
+# ============================================================
+volumes:
+  kafka_data:
+
+# ============================================================
+# NETWORKS
+# ============================================================
+# A custom bridge network lets containers find each other by name.
+# e.g., the bridge can connect to "kafka:9092" instead of an IP.
+# All services on the "pipeline" network can communicate directly.
+# ============================================================
+networks:
+  pipeline:
+    driver: bridge

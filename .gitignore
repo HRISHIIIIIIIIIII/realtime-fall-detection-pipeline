@@ -1,0 +1,23 @@
+# Delta Lake data (large files, generated)
+data/delta/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment variables
+.env
+
+# Docker volumes
+kafka_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+kafka-python-ng==2.2.2
+deltalake==0.22.3
+pyarrow>=16
+pandas==2.2.3
