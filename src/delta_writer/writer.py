@@ -31,8 +31,8 @@ from deltalake import write_deltalake
 # --- Configuration ---
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 DELTA_BASE_PATH = os.getenv("DELTA_BASE_PATH", "/data/delta")
-FLUSH_INTERVAL = int(os.getenv("FLUSH_INTERVAL", "10"))  # seconds
-FLUSH_SIZE = int(os.getenv("FLUSH_SIZE", "100"))  # rows
+FLUSH_INTERVAL = int(os.getenv("FLUSH_INTERVAL", "2"))  # seconds
+FLUSH_SIZE = int(os.getenv("FLUSH_SIZE", "25"))  # rows
 
 # --- Topic to Delta table mapping ---
 TOPIC_TABLE_MAP = {

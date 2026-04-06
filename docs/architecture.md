@@ -550,7 +550,89 @@ mqtt-kafka-flink-poc/
 
 ---
 
-## 8. Python Dependencies by Service
+## 8. Flink Web UI
+
+The Flink Web UI is available at **`http://localhost:8081`** while the pipeline is running.
+
+### 8.1 Job Graph
+
+The Job Graph tab shows a visual map of your pipeline as a DAG (Directed Acyclic Graph):
+
+```
+Source: FDS Source -> FlatMap          Source: OBJ Source -> FlatMap
+      Parallelism: 1                         Parallelism: 1
+      Busy: ~4%                              Busy: ~5%
+           │    │    │                            │    │    │
+     FORWARD FORWARD FORWARD               FORWARD FORWARD FORWARD
+           │    │                                │         │
+           ▼    ▼                                ▼         ▼
+  FlatMap->Sink  FlatMap->Sink      FlatMap->Sink   FlatMap->Sink
+  (bronze-fds)   (silver-fds)      (bronze-obj)    (silver-obj)
+```
+
+**What each element means:**
+
+- **Source boxes (top):** Reading from Kafka input topics (`fds-data`, `obj-data`). "Busy 4-5%" means Flink spends 4-5% of its time processing — the rest is waiting for new messages. Normal for low-volume data.
+- **Sink boxes (bottom):** Writing to Kafka output topics. Each box shows `Writer -> Committer` — a two-phase pattern for exactly-once delivery: Writer sends the message, Committer confirms Kafka acknowledged it.
+- **FORWARD arrows:** Data flows directly between operators on the same thread — no network shuffle. Most efficient routing strategy.
+- **Both sources connect to all 4 sinks:** Because of `.union()` in the Flink job — FDS and OBJ streams are merged before routing.
+
+### 8.2 Health Indicators
+
+| Indicator | What it means | Healthy value |
+|-----------|--------------|---------------|
+| **Backpressured (max)** | Downstream can't keep up — messages piling up | 0% |
+| **Busy (max)** | CPU time spent actively processing | Low % = pipeline has headroom |
+| **Parallelism** | Number of threads running this operator | 1 (fine for PoC) |
+
+**Backpressure** is the most important metric to watch. If a sink shows high backpressure (turns red), it means Kafka or the Delta Writer can't keep up with incoming data.
+
+### 8.3 Other UI Tabs
+
+| Tab | What you can do |
+|-----|----------------|
+| **Overview** | See available task slots, running/failed jobs |
+| **Metrics** | Live charts: records in/out per second, Kafka consumer lag |
+| **Checkpoints** | See checkpoint history, duration, last success time |
+| **Task Managers** | JVM heap usage, GC time, network throughput per worker |
+| **Exceptions** | Full stack trace if the job fails |
+
+**Actions available from the UI:**
+- **Cancel a job** — stops processing cleanly, commits final Kafka offsets
+- **Trigger a savepoint** — manually snapshot state before stopping (safe for upgrades)
+
+---
+
+## 9. Latency
+
+End-to-end latency is measured by comparing `event_time` (timestamp from the sensor) with `ingestion_time` (when the Delta Writer wrote the row to Delta Lake).
+
+| Metric | Value |
+|--------|-------|
+| Average | ~1.5s |
+| Median (P50) | ~1.5s |
+| P95 | ~2.0s |
+| P99 | ~2.0s |
+
+**Where the latency comes from:**
+
+| Stage | Latency |
+|-------|---------|
+| MQTT publish → Kafka receive | < 50ms |
+| Kafka → Flink processing | < 50ms |
+| Flink → Kafka output topics | < 50ms |
+| Kafka output → Delta Writer buffer | < 50ms |
+| Delta Writer buffer flush (FLUSH_INTERVAL=2s) | 0–2000ms |
+| Delta Lake write (Parquet + _delta_log) | 200–500ms |
+
+The dominant cost is the micro-batch flush interval. The Delta Writer accumulates rows for up to 2 seconds before writing — this is necessary because Delta Lake has high per-write overhead (Parquet encoding + transaction log update). Writing one row at a time would be ~100x slower.
+
+**Why P95/P99 don't go below 1s:**
+Even at `FLUSH_INTERVAL=1`, the Delta Lake write itself takes 200–500ms and the Kafka poll timeout adds up to 1s of wait time. For truly sub-1s latency, a different sink (Redis, Postgres) would be needed for the hot path.
+
+---
+
+## 10. Python Dependencies by Service
 
 | Service | Package | Version | Purpose |
 |---------|---------|---------|---------|
@@ -567,3 +649,170 @@ mqtt-kafka-flink-poc/
 **Why `kafka-python-ng` instead of `kafka-python`?**
 The original `kafka-python` library is no longer maintained (last release 2020).
 `kafka-python-ng` is an actively maintained community fork.
+
+---
+
+## 11. Pipeline Components — Why Each Piece Exists
+
+This section explains each component from first principles: what it is, why it was chosen, and how it fits into the pipeline.
+
+### 11.1 Eclipse Mosquitto (MQTT Broker)
+
+**What it is:** A message broker that speaks the MQTT protocol. Think of it like a post office — publishers drop off messages, subscribers pick them up.
+
+**Why MQTT and not HTTP?**
+IoT devices (radar sensors, wearables) are constrained — low power, unstable connections, limited compute. HTTP is too heavy. MQTT is designed for exactly this:
+- Tiny packet overhead (~2 bytes header vs ~hundreds for HTTP)
+- Persistent connections (device stays connected, no repeated handshakes)
+- QoS levels: 0 = fire and forget, 1 = at least once, 2 = exactly once
+- If a device disconnects mid-publish, the broker handles it gracefully
+
+**Why not use Kafka directly from the sensor?**
+Kafka's protocol is complex and heavy — not suitable for embedded devices. MQTT is the IoT standard. The bridge translates between worlds.
+
+**In this pipeline:** Radar PCs publish FDS and OBJ data to topics `fds` and `obj` on the remote Mosquitto broker. The local system Mosquitto on kcsn0010 (port 1883) is used for the simulator.
+
+---
+
+### 11.2 MQTT-Kafka Bridge (`bridge.py`)
+
+**What it is:** A Python script that sits between MQTT and Kafka. It subscribes to MQTT topics and re-publishes those messages as Kafka records.
+
+**Why is this needed?**
+MQTT and Kafka are two different worlds:
+- MQTT = IoT messaging (lightweight, fire-and-forget, no replay)
+- Kafka = data infrastructure (persistent, replayable, scalable)
+
+The bridge is the translation layer. Without it, sensor data would be lost the moment it's consumed — Kafka lets you replay, process, and distribute it to multiple consumers independently.
+
+**Key design decision — `device_id` as Kafka key:**
+```
+board_sn → Kafka key
+```
+Kafka uses the key to decide which partition a message goes to. Same key = same partition = **ordering guaranteed per device**. If device-001 sends frame 1, 2, 3 — they always arrive in order.
+
+---
+
+### 11.3 Apache Kafka
+
+**What it is:** A distributed, persistent event log. Every message written to Kafka is stored on disk and can be replayed.
+
+**Why Kafka and not just a queue (RabbitMQ, Redis)?**
+
+| Feature | Queue (RabbitMQ) | Kafka |
+|---------|-----------------|-------|
+| Message deleted after consumed? | Yes | No — retained for configurable time |
+| Multiple consumers? | Hard | Native — each consumer group reads independently |
+| Replay old messages? | No | Yes |
+| Throughput | Medium | Millions/sec |
+| Ordering | Per-queue | Per-partition |
+
+**Key concepts in this pipeline:**
+- **Topics:** `fds-data`, `obj-data` (input) → `bronze-fds`, `silver-fds`, `bronze-obj`, `silver-obj` (output)
+- **Partitions:** Each topic is split into partitions. Flink's TaskManagers read partitions in parallel
+- **Consumer groups:** Flink and delta-writer each have their own group ID, so they read independently without interfering
+- **Offsets:** Kafka tracks how far each consumer has read. If delta-writer crashes, it resumes from its last committed offset — no data loss
+
+**KRaft mode (no Zookeeper):**
+Old Kafka needed Zookeeper (a separate cluster coordination service) just to function. KRaft (Kafka Raft) bakes coordination directly into Kafka. One fewer service to manage.
+
+---
+
+### 11.4 Apache Flink (PyFlink)
+
+**What it is:** A stateful stream processing engine. It reads data from Kafka in real-time, transforms it, and writes results back to Kafka.
+
+**Why Flink and not just Python scripts?**
+A plain Python script reading from Kafka works, but:
+- No parallelism — one thread, one partition
+- No fault tolerance — crashes lose in-flight data
+- No windowing — can't do "count falls in last 5 minutes" natively
+- No backpressure — if Kafka produces faster than you consume, you fall behind
+
+Flink handles all of this. It's designed to process millions of events per second reliably.
+
+**Key concepts:**
+
+*JobManager vs TaskManager:*
+- **JobManager** = the boss. Coordinates the job, assigns work, monitors health
+- **TaskManager** = the worker. Actually processes data. You can have many TaskManagers for scale
+
+*DataStream API:*
+```
+KafkaSource → map/flatMap (transform) → KafkaSink
+```
+
+*`flat_map` for OBJ data:*
+One OBJ message contains multiple people (array). `flat_map` explodes 1 message → N rows (one per person). A regular `map` can only do 1 → 1.
+
+*Why Flink writes back to Kafka (not directly to Delta Lake):*
+PyFlink's dependency (`apache-beam`) requires `pyarrow < 10`. Delta Lake requires `pyarrow >= 16`. Unresolvable conflict. Flink writes to Kafka output topics → separate delta-writer handles Delta Lake. This is a common production pattern anyway.
+
+---
+
+### 11.5 Delta Lake (`delta-writer` + `deltalake` library)
+
+**What it is:** An open table format that sits on top of Parquet files. Adds ACID transactions, schema enforcement, and time travel to plain files.
+
+**Why Delta Lake and not just Parquet files?**
+
+Plain Parquet has no safety guarantees:
+- Write a file → it's there. Crash mid-write → corrupted partial file
+- No history — you can't go back to yesterday's data
+- No schema enforcement — wrong column types go in silently
+
+Delta Lake adds a `_delta_log/` directory alongside your Parquet files. Every write is recorded as a JSON transaction log entry. This gives you:
+- **Atomicity:** Write either fully succeeds or fully fails
+- **Time travel:** `DeltaTable(path, version=5)` reads the table as it was at version 5
+- **Schema enforcement:** Can't accidentally write a column with wrong type
+- **ACID transactions:** Multiple writers won't corrupt each other
+
+**Medallion Architecture in this pipeline:**
+```
+Bronze  →  raw JSON exactly as it came from MQTT (never modified)
+Silver  →  cleaned, parsed, flattened (board_sn → device_id, OBJ array → 1 row per person)
+Gold    →  (not yet built) aggregations: falls per hour, avg velocity per zone
+```
+
+**Why keep Bronze?**
+If the Silver transformation has a bug, you can re-process from Bronze without going back to re-collect sensor data.
+
+**Micro-batching in delta-writer:**
+Delta Lake isn't designed for single-row writes (massive overhead per write). The writer buffers rows in RAM and flushes every 2 seconds or 25 rows. Each flush = one Parquet file + one `_delta_log` entry.
+
+---
+
+### 11.6 How It All Connects
+
+```
+Radar PCs
+    │ MQTT publish (fds / obj topics)
+    ▼
+Mosquitto Broker (host)
+    │ paho-mqtt subscribe
+    ▼
+MQTT-Kafka Bridge (bridge.py)
+    │ KafkaProducer — key=device_id
+    ▼
+Kafka (fds-data, obj-data topics)
+    │ KafkaSource — consumer group: flink-fall-detection
+    ▼
+Flink (fall_detection_job.py)
+    │ ProcessFDS: parse + enrich
+    │ ProcessOBJ: parse + flatten per-person
+    │ KafkaSink — 4 output topics
+    ▼
+Kafka (bronze-fds, silver-fds, bronze-obj, silver-obj)
+    │ KafkaConsumer — consumer group: delta-writer
+    ▼
+Delta Writer (writer.py)
+    │ micro-batch buffer → flush every 2s or 25 rows
+    ▼
+Delta Lake (local filesystem)
+    ├── bronze_fds/   ← raw FDS JSON
+    ├── silver_fds/   ← parsed, is_falling bool
+    ├── bronze_obj/   ← raw OBJ JSON
+    └── silver_obj/   ← one row per tracked person
+```
+
+Each component has a single, well-defined responsibility. That's why the system is debuggable — if something breaks, you check one component at a time.
