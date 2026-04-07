@@ -148,6 +148,9 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 1
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 10s
       KAFKA_BROKER: "kafka:9092"
       DELTA_BASE_PATH: "/opt/flink/delta"
       FLUSH_INTERVAL: "10"
@@ -180,6 +183,9 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 1
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 10s
       KAFKA_BROKER: "kafka:9092"
       DELTA_BASE_PATH: "/opt/flink/delta"
       FLUSH_INTERVAL: "10"
