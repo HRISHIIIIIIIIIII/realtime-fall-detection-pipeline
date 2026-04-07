@@ -2,14 +2,14 @@
 
 MQTT sensors → Kafka → Flink → Delta Lake + Redis + Feast + FastAPI
 
-## Run from scratch
+## Run with real sensors
 
 ```bash
 # 1. Clone and enter
 git clone git@github.com:HRISHIIIIIIIIIII/realtime-fall-detection-pipeline.git
 cd realtime-fall-detection-pipeline
 
-# 2. Start all services
+# 2. Start all services (simulator excluded by default)
 docker compose up -d
 
 # 3. Submit the Flink processing job
@@ -22,6 +22,29 @@ docker compose exec redis-writer bash -c "cd /app/feast_repo && feast apply"
 # 5. Restart redis-writer to pick up Feast registry
 docker compose restart redis-writer
 ```
+
+## Run with simulator (no real sensors needed)
+
+```bash
+# 1. Clone and enter
+git clone git@github.com:HRISHIIIIIIIIIII/realtime-fall-detection-pipeline.git
+cd realtime-fall-detection-pipeline
+
+# 2. Start all services + simulator
+docker compose --profile testing up -d
+
+# 3. Submit the Flink processing job
+docker compose exec flink-jobmanager /opt/flink/bin/flink run \
+    --python /opt/flink/jobs/fall_detection_job.py
+
+# 4. Initialize Feast feature store
+docker compose exec redis-writer bash -c "cd /app/feast_repo && feast apply"
+
+# 5. Restart redis-writer to pick up Feast registry
+docker compose restart redis-writer
+```
+
+The simulator publishes FDS-only data (fall events) to the MQTT broker. OBJ data comes from real sensors. To publish both FDS and OBJ from simulator, set `PUBLISH_MODE: "both"` in docker-compose.yml.
 
 ## Verify
 
@@ -62,12 +85,6 @@ curl http://localhost:8000/api/health
 
 ```bash
 docker compose down
-```
-
-## Run simulator (for testing without real sensors)
-
-```bash
-docker compose --profile testing up -d sensor-simulator
 ```
 
 ## Documentation

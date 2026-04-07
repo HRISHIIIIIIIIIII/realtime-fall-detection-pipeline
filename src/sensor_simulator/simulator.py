@@ -24,6 +24,8 @@ LOCATION = os.getenv("LOCATION", "room1")
 PUBLISH_INTERVAL = float(os.getenv("PUBLISH_INTERVAL", "0.5"))
 # How often a fall occurs (0.02 = ~2% of FDS messages)
 FALL_PROBABILITY = float(os.getenv("FALL_PROBABILITY", "0.02"))
+# Which data to publish: "both", "fds", or "obj"
+PUBLISH_MODE = os.getenv("PUBLISH_MODE", "both")
 
 # --- MQTT Topics ---
 FDS_TOPIC = "fds"
@@ -186,12 +188,14 @@ def main():
             num_people = random.randint(1, 3)
 
             # Generate and publish FDS message
-            fds_msg = generate_fds_message(is_falling)
-            client.publish(FDS_TOPIC, json.dumps(fds_msg))
+            if PUBLISH_MODE in ("both", "fds"):
+                fds_msg = generate_fds_message(is_falling)
+                client.publish(FDS_TOPIC, json.dumps(fds_msg))
 
             # Generate and publish OBJ message
-            obj_msg = generate_obj_message(num_people)
-            client.publish(OBJ_TOPIC, json.dumps(obj_msg))
+            if PUBLISH_MODE in ("both", "obj"):
+                obj_msg = generate_obj_message(num_people)
+                client.publish(OBJ_TOPIC, json.dumps(obj_msg))
 
             if is_falling:
                 print(f"[FALL] Frame {fds_msg['fn']} — Falling detected!")

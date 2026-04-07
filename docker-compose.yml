@@ -81,12 +81,13 @@ services:
     profiles: ["testing"]        
     network_mode: host
     environment:
-      MQTT_BROKER: "192.168.29.44"
+      MQTT_BROKER: "34.236.215.53"
       MQTT_PORT: "1883"
       DEVICE_ID: "kc_sim_001"
       LOCATION: "room1"
       PUBLISH_INTERVAL: "0.5"
       FALL_PROBABILITY: "0.02"
+      PUBLISH_MODE: "fds"
     restart: unless-stopped
 
   # ============================================================
