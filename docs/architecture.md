@@ -443,6 +443,9 @@ One row per tracked person per frame:
 | flink-jobmanager | flink:1.18 (custom) | 8081 | Flink coordinator + Web UI |
 | flink-taskmanager | flink:1.18 (custom) | — | Flink worker (processes data) |
 | delta-writer | python:3.10-slim (custom) | — | Reads from Kafka, writes to Delta Lake |
+| redis | redis:7-alpine | 6379 | In-memory store (Feast online store + hot cache) |
+| redis-writer | python:3.10-slim (custom) | — | Kafka → Redis + Feast feature push |
+| fastapi-app | python:3.10-slim (custom) | 8000 | REST API + Feast serving + MQTT alerts |
 
 **Note:** Mosquitto is NOT containerized — the existing system Mosquitto on
 kcsn0010 (port 1883) is used directly. See [troubleshooting.md](troubleshooting.md)
@@ -646,9 +649,23 @@ Even at `FLUSH_INTERVAL=1`, the Delta Lake write itself takes 200–500ms and th
 | delta-writer | pyarrow | >=16 | Columnar data format (required by deltalake) |
 | delta-writer | pandas | 2.2.3 | DataFrame operations for batching |
 
+| redis-writer | kafka-python-ng | 2.2.2 | Kafka consumer |
+| redis-writer | redis | 4.6.0 | Redis client |
+| redis-writer | feast[redis] | 0.40.0 | Feature store (push to online store) |
+| redis-writer | pandas | 2.2.3 | DataFrame for Feast push |
+| fastapi-app | fastapi | 0.115.0 | REST API framework |
+| fastapi-app | uvicorn | 0.30.0 | ASGI server for FastAPI |
+| fastapi-app | redis | 4.6.0 | Redis client |
+| fastapi-app | paho-mqtt | 2.1.0 | MQTT publisher for alerts |
+| fastapi-app | feast[redis] | 0.40.0 | Feature store (online feature serving) |
+| fastapi-app | pandas | 2.2.3 | DataFrame for Feast queries |
+
 **Why `kafka-python-ng` instead of `kafka-python`?**
 The original `kafka-python` library is no longer maintained (last release 2020).
 `kafka-python-ng` is an actively maintained community fork.
+
+**Why `redis==4.6.0` instead of `5.x`?**
+Feast 0.40.0 requires `redis < 5`. The 4.x API is functionally identical for our use case.
 
 ---
 
@@ -816,3 +833,135 @@ Delta Lake (local filesystem)
 ```
 
 Each component has a single, well-defined responsibility. That's why the system is debuggable — if something breaks, you check one component at a time.
+
+---
+
+## 12. Hot Path: Redis + Feast + FastAPI
+
+### 12.1 Why a Hot Path?
+
+The cold path (Delta Writer → Delta Lake) is optimized for durable storage and batch analytics.
+It has ~1.5s write latency and requires scanning Parquet files to answer queries.
+This is unsuitable for real-time use cases like:
+- "What is device kc2508p025 doing RIGHT NOW?"
+- "How many people are in room1?"
+- "Serve ML features to the fall verification model in <10ms"
+
+The hot path uses Redis (in-memory, sub-millisecond reads) with Feast (feature store)
+and FastAPI (REST API + MQTT alerting) to handle real-time queries.
+
+### 12.2 Architecture — Cold Path vs Hot Path
+
+```
+Flink → Kafka (silver topics)
+              │
+              ├──→ Delta Writer → Delta Lake          COLD PATH
+              │    (batch, ~1.5s latency)              Permanent storage, training data
+              │                                        Consumer group: delta-writer
+              │
+              └──→ Redis Writer → Redis                HOT PATH
+                   (streaming, <50ms latency)           10-min TTL, real-time queries
+                   Consumer group: redis-writer         Feast online store
+                                    │
+                                    └──→ Feast          Feature serving layer
+                                          │
+                                          └──→ FastAPI  REST API + verification model
+                                                │
+                                                └──→ MQTT (alerts/verified)
+```
+
+Both paths consume from the same Kafka topics independently — they have
+separate consumer groups, so one doesn't affect the other.
+
+### 12.3 Redis Data Model
+
+All keys auto-expire after 10 minutes (TTL 600s). If a device stops transmitting, its data disappears automatically.
+
+| Key Pattern | Redis Type | What it stores |
+|-------------|-----------|---------------|
+| `device:{device_id}:fds` | String (JSON) | Latest FDS reading for this device |
+| `device:{device_id}:obj` | String (JSON) | Latest OBJ frame with all tracked people |
+| `fall:{device_id}:{timestamp}` | String (JSON) | Individual fall event |
+| `devices:active` | Set | All device IDs seen in last 10 min |
+
+**Why Redis Sets for active devices?**
+`SMEMBERS devices:active` returns all active device IDs in one call — no need to scan keys with patterns.
+
+### 12.4 Feast Feature Store
+
+**What is Feast?**
+A feature store that manages ML features. It ensures the same features used during
+model training (from batch data in Delta Lake) are available at serving time
+(from real-time data in Redis). Without it, training and serving features drift apart.
+
+**Key concepts:**
+- **Entity:** The "thing" features are computed for — `device_id` in our case
+- **Feature View:** A group of related features with a schema and TTL
+- **Push Source:** Streaming ingestion — redis-writer pushes features directly to the online store
+- **Online Store:** Redis — sub-millisecond feature retrieval at serving time
+- **Offline Store:** File-based (can be upgraded to Delta Lake for training)
+
+**Feature views defined:**
+
+*fds_realtime_features:*
+| Feature | Type | Description |
+|---------|------|-------------|
+| activity | Int64 | Activity level (0-100) |
+| position_x | Float64 | X position in room (meters) |
+| position_y | Float64 | Y position in room (meters) |
+| is_falling | Bool | Current fall status from on-device model |
+| result | String | "Falling" or "None" |
+
+*obj_realtime_features:*
+| Feature | Type | Description |
+|---------|------|-------------|
+| people_count | Int64 | Number of people tracked in room |
+| avg_velocity | Float64 | Average velocity of tracked people |
+| avg_height | Float64 | Average height of tracked people |
+
+*fall_history_features:*
+| Feature | Type | Description |
+|---------|------|-------------|
+| fall_count_10min | Int64 | Number of falls in last 10 minutes |
+| last_fall_time | String | Timestamp of most recent fall |
+| time_since_last_fall_sec | Float64 | Seconds since last fall |
+
+### 12.5 FastAPI REST API
+
+Access at: `http://localhost:8000`
+Swagger docs at: `http://localhost:8000/docs`
+
+| Method | Path | Source | What it does |
+|--------|------|--------|-------------|
+| GET | `/api/devices` | Redis | List all active devices |
+| GET | `/api/devices/{device_id}` | Redis | Latest FDS + OBJ data for one device |
+| GET | `/api/falls` | Redis | All fall events in last 10 min |
+| GET | `/api/falls/{device_id}` | Redis | Falls for a specific device |
+| GET | `/api/features/{device_id}` | Feast | All ML features for the verification model |
+| POST | `/api/verify-fall` | Feast + Model | Get features → run model → publish MQTT alert |
+| POST | `/api/mqtt/publish` | MQTT | Publish any message to any MQTT topic |
+| GET | `/api/health` | All | Redis + MQTT + Feast connectivity check |
+
+### 12.6 Fall Verification Flow
+
+The centralized ML model determines whether an on-device `result: "Falling"` is a
+true positive or false positive, using richer context from multiple feature sources.
+
+```
+1. Sensor detects fall → publishes FDS with result: "Falling"
+2. Flink processes → writes to silver-fds Kafka topic
+3. Redis Writer:
+   a. Stores fall event in Redis (fall:{device_id}:{timestamp})
+   b. Pushes FDS features to Feast (activity, position, is_falling)
+   c. Updates fall history features (fall_count_10min, time_since_last_fall)
+4. POST /api/verify-fall called with {device_id, event_time}
+5. FastAPI queries Feast for all features:
+   - activity, position_x, position_y (from FDS)
+   - people_count, avg_velocity, avg_height (from OBJ)
+   - fall_count_10min, time_since_last_fall_sec (from history)
+6. Features fed to verification model → true positive or false positive
+7. If true positive → publish to MQTT topic "alerts/verified"
+```
+
+The verification model is currently a placeholder (verifies if fall_count >= 1).
+Replace with the real model in `src/fastapi_app/app.py` at the `verify_fall` function.

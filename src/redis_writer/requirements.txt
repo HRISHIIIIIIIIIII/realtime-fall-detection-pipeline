@@ -1,0 +1,4 @@
+kafka-python-ng==2.2.2
+redis==4.6.0
+feast[redis]==0.40.0
+pandas==2.2.3

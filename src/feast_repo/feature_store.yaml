@@ -1,0 +1,9 @@
+project: fall_detection
+provider: local
+registry: /data/feast/registry.db
+online_store:
+  type: redis
+  connection_string: redis:6379
+offline_store:
+  type: file
+entity_key_serialization_version: 2

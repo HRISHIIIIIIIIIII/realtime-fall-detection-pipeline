@@ -78,6 +78,7 @@ services:
   sensor-simulator:
     build: ./src/sensor_simulator
     container_name: sensor-simulator
+    profiles: ["testing"]        
     network_mode: host
     environment:
       MQTT_BROKER: "192.168.29.44"
@@ -116,12 +117,10 @@ services:
     depends_on:
       - kafka
     environment:
-      MQTT_BROKER: "host.docker.internal"
+      MQTT_BROKER: "34.236.215.53"
       MQTT_PORT: "1883"
       KAFKA_BROKER: "kafka:9092"
       MQTT_TOPICS: "fds,obj"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - pipeline
     restart: unless-stopped
@@ -224,6 +223,82 @@ services:
     restart: unless-stopped
 
 
+  # ============================================================
+  # REDIS - In-Memory Data Store (Feast Online Store)
+  # ============================================================
+  # Purpose: Hot cache for real-time device data + Feast online
+  #          store for ML feature serving. All keys auto-expire
+  #          after 10 minutes (TTL 600s).
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
+  # ============================================================
+  # REDIS WRITER - Kafka → Redis + Feast Feature Push
+  # ============================================================
+  # Purpose: Consumes from the same Kafka silver topics as
+  #          delta-writer (independent consumer group). Writes
+  #          raw data to Redis for fast queries AND pushes
+  #          computed features to Feast online store.
+  # ============================================================
+  redis-writer:
+    build: ./src/redis_writer
+    container_name: redis-writer
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_TTL: "600"
+      FEAST_REPO_PATH: "/app/feast_repo"
+    volumes:
+      - ./src/feast_repo:/app/feast_repo
+      - feast_registry:/data/feast
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
+  # ============================================================
+  # FASTAPI APP - REST API + Feast Serving + MQTT Alerts
+  # ============================================================
+  # Purpose: Exposes REST endpoints for querying device data,
+  #          serves ML features via Feast, runs the fall
+  #          verification model, and publishes alerts to MQTT.
+  #
+  # Access at: http://localhost:8000
+  # Swagger docs at: http://localhost:8000/docs
+  # ============================================================
+  fastapi-app:
+    build: ./src/fastapi_app
+    container_name: fastapi-app
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      MQTT_BROKER: "34.236.215.53"
+      MQTT_PORT: "1883"
+      FEAST_REPO_PATH: "/app/feast_repo"
+    volumes:
+      - ./src/feast_repo:/app/feast_repo
+      - feast_registry:/data/feast
+    depends_on:
+      - redis
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+
 # ============================================================
 # VOLUMES
 # ============================================================
@@ -233,6 +308,8 @@ services:
 # ============================================================
 volumes:
   kafka_data:
+  feast_registry:
+
 
 # ============================================================
 # NETWORKS
