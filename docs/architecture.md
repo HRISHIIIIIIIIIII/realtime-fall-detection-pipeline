@@ -38,7 +38,7 @@ Multiple PCs (radar sensors)
               └─ silver-fds  └─ silver-obj
                       │              │
                       ▼              ▼
-                  Delta Lake Writer (Python)
+              Scala Flink Delta Writer (DeltaSink)
                       │              │
                       ▼              ▼
                   Delta Lake (local filesystem)
@@ -55,10 +55,14 @@ Delta Lake's Python library (`deltalake`) requires `pyarrow >= 16`.
 These are fundamentally incompatible — no version of pyarrow satisfies both.
 
 The solution is a common production pattern: **separate stream processing
-from storage writing**. Flink handles the transformations and writes to
-intermediate Kafka topics. A separate lightweight Python service (Delta Writer)
-reads those topics and writes to Delta Lake. Each service has its own
-container with compatible dependencies.
+from storage writing**. The PyFlink job handles transformations and writes
+to intermediate Kafka topics. A separate Flink job written in Scala
+(the `flink-delta-writer` service) reads those topics and writes to
+Delta Lake using Flink's native `DeltaSink` connector.
+
+By moving the writer to the JVM (Scala), the pyarrow conflict disappears
+entirely. The Scala job also gets Flink's checkpointing and exactly-once
+delivery for free — no custom micro-batching loop needed.
 
 See [troubleshooting.md](troubleshooting.md) Section 4 for the full story.
 
@@ -136,10 +140,10 @@ service to run. We use KRaft mode with `apache/kafka:3.9.0`.
 |-------|----------|----------|---------|
 | `fds-data` | MQTT-Kafka Bridge | PyFlink | Raw FDS messages from MQTT |
 | `obj-data` | MQTT-Kafka Bridge | PyFlink | Raw OBJ messages from MQTT |
-| `bronze-fds` | PyFlink | Delta Writer | Raw FDS (passthrough) |
-| `bronze-obj` | PyFlink | Delta Writer | Raw OBJ (passthrough) |
-| `silver-fds` | PyFlink | Delta Writer | Cleaned/parsed FDS |
-| `silver-obj` | PyFlink | Delta Writer | Flattened OBJ (1 row per person) |
+| `bronze-fds` | PyFlink | Scala Delta Writer | Raw FDS (passthrough) |
+| `bronze-obj` | PyFlink | Scala Delta Writer | Raw OBJ (passthrough) |
+| `silver-fds` | PyFlink | Scala Delta Writer, Redis Writer | Cleaned/parsed FDS |
+| `silver-obj` | PyFlink | Scala Delta Writer, Redis Writer | Flattened OBJ (1 row per person) |
 
 Message key = device_id (board_sn / board) — ensures all data from
 one device stays ordered in the same partition.
@@ -192,26 +196,35 @@ accessible for Python developers.
 - Writes results to 4 output Kafka topics (bronze + silver for each data type)
 - Does NOT write to Delta Lake directly (see dependency conflict note above)
 
-### 3.4 Delta Lake Writer (Custom Service)
+### 3.4 Scala Flink Delta Writer
 
 **What is it?**
-A lightweight Python service that reads from Flink's output Kafka topics
-and writes to Delta Lake tables on the local filesystem.
+A Flink job written in Scala that reads from the 4 processed Kafka topics
+and writes to Delta Lake tables using Flink's official `delta-flink` connector
+(`DeltaSink`). It runs as a second job on the same Flink cluster alongside
+the PyFlink processing job.
 
-**Why a separate service?**
-Because of the pyarrow dependency conflict between PyFlink and deltalake
-(see Section 2 above). By running in its own container, it can use
-whatever pyarrow version deltalake needs.
+**Why Scala instead of Python?**
+Because of the pyarrow dependency conflict between PyFlink and `deltalake`
+(see Section 2 above). By writing the Delta writer in Scala, it runs on the
+JVM — no Python environment, no pyarrow at all. The conflict disappears.
 
-**Micro-batching pattern:**
-Writing one Parquet file per Kafka message would create thousands of tiny
-files (the "small files problem"). Instead, the writer accumulates rows
-in memory and flushes them as a batch:
-- Every `FLUSH_INTERVAL` seconds (default: 10), OR
-- When the buffer reaches `FLUSH_SIZE` rows (default: 100)
-- Whichever comes first
+**How DeltaSink works:**
+`DeltaSink` is a Flink sink that integrates with Flink's checkpointing:
+- Data from Kafka is buffered in memory by Flink
+- Every 30 seconds a checkpoint fires
+- On checkpoint completion, DeltaSink writes a Parquet file and adds an entry
+  to `_delta_log/`
 
-Each flush creates one Parquet file + one _delta_log entry.
+This gives **exactly-once** guarantees: if the job crashes and restarts,
+Flink replays from the last checkpoint offset. No data is lost or duplicated.
+
+**Source:** `src/flink_delta_writer_scala/`
+- `pom.xml` — Maven build, produces a fat JAR
+- `DeltaWriterJob.scala` — main job: 4 Kafka sources → 4 DeltaSinks
+- `schemas/` — RowType definitions (column names + types per table)
+- `parsers/` — JSON string → Flink Row for each topic
+- `Dockerfile` — two-stage: Maven build → submit JAR to Flink cluster
 
 ### 3.5 Delta Lake
 

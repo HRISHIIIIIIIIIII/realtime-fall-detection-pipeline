@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.kubocare</groupId>
+  <artifactId>flink-delta-writer</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <scala.version>2.12.17</scala.version>
+    <scala.binary.version>2.12</scala.binary.version>
+    <flink.version>1.18.1</flink.version>
+    <delta.flink.version>3.2.1</delta.flink.version>
+    <hadoop.version>3.3.6</hadoop.version>
+  </properties>
+
+  <dependencies>
+
+    <!-- Scala runtime -->
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+
+    <!-- Flink core — "provided" because flink:1.18 image already has these JARs -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-table-api-java-bridge</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Flink Kafka connector — NOT provided; must be bundled in fat JAR -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>3.1.0-1.18</version>
+    </dependency>
+
+    <!-- Delta Lake Flink connector — official connector, supports Flink 1.18 -->
+    <dependency>
+      <groupId>io.delta</groupId>
+      <artifactId>delta-flink</artifactId>
+      <version>${delta.flink.version}</version>
+    </dependency>
+
+    <!-- Delta Standalone — required by delta-flink, reads/writes Delta log files -->
+    <dependency>
+      <groupId>io.delta</groupId>
+      <artifactId>delta-standalone_${scala.binary.version}</artifactId>
+      <version>${delta.flink.version}</version>
+    </dependency>
+
+    <!-- Hadoop — needed for Delta Lake's FileSystem API on local disk.
+         "provided" because flink:1.18 includes flink-shaded-hadoop in /opt/flink/lib/ -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client</artifactId>
+      <version>${hadoop.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Jackson — for JSON parsing.
+         "provided" because Flink bundles its own Jackson. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.15.2</version>
+      <scope>provided</scope>
+    </dependency>
+
+  </dependencies>
+
+  <build>
+    <plugins>
+
+      <!-- Compile Scala source files -->
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+        <version>4.8.1</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>compile</goal>
+              <goal>testCompile</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Build a fat JAR — bundles all non-provided dependencies into one file -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <artifactSet>
+                <excludes>
+                  <!-- Don't bundle these — Flink provides them at runtime -->
+                  <exclude>org.apache.flink:flink-*</exclude>
+                  <exclude>org.apache.hadoop:*</exclude>
+                  <exclude>com.fasterxml.jackson.core:*</exclude>
+                </excludes>
+              </artifactSet>
+              <transformers>
+                <!-- Set main class in MANIFEST.MF so `flink run` can find it -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.kubocare.delta.DeltaWriterJob</mainClass>
+                </transformer>
+                <!-- Merge META-INF/services to avoid SPI (Service Provider Interface) conflicts -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <!-- Name the fat JAR with a "-fat" suffix; keep the thin JAR too -->
+              <shadedArtifactAttached>true</shadedArtifactAttached>
+              <shadedClassifierName>fat</shadedClassifierName>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+
+</project>

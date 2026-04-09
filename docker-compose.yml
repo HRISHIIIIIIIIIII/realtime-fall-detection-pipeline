@@ -146,7 +146,7 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
+        taskmanager.numberOfTaskSlots: 8
         parallelism.default: 1
         restart-strategy: fixed-delay
         restart-strategy.fixed-delay.attempts: 10
@@ -155,6 +155,8 @@ services:
       DELTA_BASE_PATH: "/opt/flink/delta"
       FLUSH_INTERVAL: "10"
       FLUSH_SIZE: "100"
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
     depends_on:
       - kafka
     networks:
@@ -170,9 +172,9 @@ services:
   # In production you'd have multiple TaskManagers across machines.
   # For our PoC, one is enough.
   #
-  # taskmanager.numberOfTaskSlots: 4
-  #   Each slot can run one parallel pipeline. We only use 1 slot
-  #   (parallelism=1) but having 4 available is fine.
+  # taskmanager.numberOfTaskSlots: 8
+  #   Bumped from 4 to 8: two Flink jobs now run simultaneously
+  #   (PyFlink job + Scala Delta Writer), each needing task slots.
   # ============================================================
   flink-taskmanager:
     build: ./src/flink_jobs
@@ -181,7 +183,7 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
+        taskmanager.numberOfTaskSlots: 8
         parallelism.default: 1
         restart-strategy: fixed-delay
         restart-strategy.fixed-delay.attempts: 10
@@ -192,42 +194,51 @@ services:
       FLUSH_SIZE: "100"
     depends_on:
       - flink-jobmanager
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
     networks:
       - pipeline
     restart: unless-stopped
 
 
   # ============================================================
-  # DELTA WRITER - Writes Kafka data to Delta Lake tables
+  # FLINK DELTA WRITER - Writes Kafka data to Delta Lake (Scala)
   # ============================================================
-  # Purpose: Reads processed data from Flink's output Kafka topics
-  #          and writes to Delta Lake tables on the local filesystem.
+  # Purpose: Reads from the 4 processed Kafka topics and writes
+  #          to Delta Lake tables using Flink's native DeltaSink.
   #
-  # Why separate from Flink?
-  #   PyFlink requires pyarrow < 10 (via apache-beam dependency)
-  #   deltalake requires pyarrow >= 16
-  #   They cannot coexist. This is a common pattern in production:
-  #   the stream processor handles logic, a separate writer handles storage.
+  # Why Scala instead of Python?
+  #   PyFlink requires pyarrow < 10; deltalake requires pyarrow >= 16.
+  #   By moving to Scala/JVM, the conflict disappears entirely.
+  #   We also get Flink's checkpointing + exactly-once guarantees
+  #   instead of a custom polling loop.
   #
-  # Volumes:
-  #   ./data/delta is mounted so Delta tables are accessible from
-  #   both inside the container and on the host machine.
+  # How it works:
+  #   This container builds the fat JAR (via multi-stage Dockerfile)
+  #   and submits it to the running Flink cluster. The job runs on
+  #   flink-taskmanager. Data appears in Delta tables every ~30s
+  #   (checkpoint interval).
+  #
+  # restart: on-failure (NOT unless-stopped):
+  #   `flink run` submits the job and exits 0. unless-stopped would
+  #   restart the container on success, causing infinite submissions.
+  #   on-failure only restarts if submission fails (exit code != 0).
   # ============================================================
-  delta-writer:
-    build: ./src/delta_writer
-    container_name: delta-writer
+  flink-delta-writer:
+    build: ./src/flink_delta_writer_scala
+    container_name: flink-delta-writer
     environment:
       KAFKA_BROKER: "kafka:9092"
-      DELTA_BASE_PATH: "/data/delta"
-      FLUSH_INTERVAL: "10"
-      FLUSH_SIZE: "100"
+      DELTA_BASE_PATH: "/opt/flink/delta"
     volumes:
-      - ./data/delta:/data/delta
+      - ./data/delta:/opt/flink/delta
     depends_on:
+      - flink-jobmanager
+      - flink-taskmanager
       - kafka
     networks:
       - pipeline
-    restart: unless-stopped
+    restart: on-failure
 
 
   # ============================================================
@@ -316,6 +327,7 @@ services:
 volumes:
   kafka_data:
   feast_registry:
+  flink_checkpoints:
 
 
 # ============================================================

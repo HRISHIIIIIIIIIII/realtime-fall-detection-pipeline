@@ -1,6 +1,6 @@
 # Real-Time Fall Detection Pipeline
 
-MQTT sensors → Kafka → Flink → Delta Lake + Redis + Feast + FastAPI
+MQTT sensors → Kafka → PyFlink → Kafka → Scala Flink (DeltaSink) → Delta Lake + Redis + Feast + FastAPI
 
 ## Run with real sensors
 
@@ -10,9 +10,10 @@ git clone git@github.com:HRISHIIIIIIIIIII/realtime-fall-detection-pipeline.git
 cd realtime-fall-detection-pipeline
 
 # 2. Start all services (simulator excluded by default)
+# Note: flink-delta-writer builds the Scala fat JAR on first run (~5 min)
 docker compose up -d
 
-# 3. Submit the Flink processing job
+# 3. Submit the PyFlink processing job
 docker compose exec flink-jobmanager /opt/flink/bin/flink run \
     --python /opt/flink/jobs/fall_detection_job.py
 
@@ -31,9 +32,10 @@ git clone git@github.com:HRISHIIIIIIIIIII/realtime-fall-detection-pipeline.git
 cd realtime-fall-detection-pipeline
 
 # 2. Start all services + simulator
+# Note: flink-delta-writer builds the Scala fat JAR on first run (~5 min)
 docker compose --profile testing up -d
 
-# 3. Submit the Flink processing job
+# 3. Submit the PyFlink processing job
 docker compose exec flink-jobmanager /opt/flink/bin/flink run \
     --python /opt/flink/jobs/fall_detection_job.py
 
@@ -50,6 +52,7 @@ The simulator publishes FDS-only data (fall events) to the MQTT broker. OBJ data
 
 ```bash
 # Check all containers are running
+# flink-delta-writer will show as "exited" after successful JAR submission — that's normal
 docker compose ps
 
 # Check Delta Lake tables
@@ -80,6 +83,8 @@ curl http://localhost:8000/api/health
 |----|-----|
 | Flink Web UI | http://localhost:8081 |
 | FastAPI Swagger Docs | http://localhost:8000/docs |
+
+The Flink Web UI should show **two running jobs**: `Fall Detection Pipeline` (PyFlink) and `Scala Delta Lake Writer`. Data appears in Delta tables every ~30 seconds (checkpoint interval).
 
 ## Stop
 
