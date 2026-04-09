@@ -119,14 +119,14 @@ still couldn't connect via `localhost`. Testing from inside the container
 revealed that only the host's actual IP address works:
 
 ```
-127.0.0.1:1883     → FAILED: Connection refused
-localhost:1883     → FAILED: Connection refused
-192.168.29.44:1883 → SUCCESS
+127.0.0.1:1883        → FAILED: Connection refused
+localhost:1883        → FAILED: Connection refused
+<host-ip>:1883        → SUCCESS
 ```
 
 **Fix:**
-Set `MQTT_BROKER: "192.168.29.44"` in the Docker Compose environment
-for the sensor-simulator service.
+Set `MQTT_BROKER: "<host-ip>"` in the Docker Compose environment
+for the sensor-simulator service (use the host machine's actual LAN IP).
 
 For the mqtt-kafka-bridge (which uses the Docker `pipeline` network, not
 `network_mode: host`), use `extra_hosts` to map `host.docker.internal`
@@ -205,11 +205,18 @@ Instead of one container running both PyFlink and deltalake, we split into:
 - **flink-jobmanager / flink-taskmanager**: Runs PyFlink with apache-flink
   and its compatible pyarrow. Reads from Kafka, processes data, writes
   results to OUTPUT Kafka topics.
-- **delta-writer**: Runs deltalake with its compatible pyarrow. Reads from
+- **delta-writer** (initial approach): Runs deltalake with its compatible pyarrow. Reads from
   output Kafka topics, writes to Delta Lake files.
 
 This is actually a common production pattern — stream processors typically
 write to Kafka, and specialized sink services handle storage.
+
+**Further evolution: replaced Python delta-writer with Scala Flink DeltaSink.**
+
+The Python delta-writer still needed custom micro-batch polling. We replaced it with
+`flink-delta-writer` — a Scala Flink job using the official `delta-flink` DeltaSink connector.
+This runs on the JVM (no pyarrow at all) and integrates with Flink checkpointing for
+exactly-once delivery without any custom code. See `src/flink_delta_writer_scala/`.
 
 **Updated requirements.txt for each:**
 

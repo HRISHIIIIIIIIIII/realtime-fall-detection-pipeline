@@ -451,11 +451,11 @@ One row per tracked person per frame:
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | kafka | apache/kafka:3.9.0 | 9092 | Distributed event streaming (KRaft mode, no Zookeeper) |
-| sensor-simulator | python:3.10-slim (custom) | — | Generates fake FDS and OBJ data for testing |
+| sensor-simulator | python:3.10-slim (custom) | — | Generates fake FDS data for testing (profile: testing) |
 | mqtt-kafka-bridge | python:3.10-slim (custom) | — | Subscribes to MQTT topics, produces to Kafka |
 | flink-jobmanager | flink:1.18 (custom) | 8081 | Flink coordinator + Web UI |
 | flink-taskmanager | flink:1.18 (custom) | — | Flink worker (processes data) |
-| delta-writer | python:3.10-slim (custom) | — | Reads from Kafka, writes to Delta Lake |
+| flink-delta-writer | eclipse-temurin:17 (custom) | — | Builds Scala fat JAR + submits DeltaSink job to Flink cluster |
 | redis | redis:7-alpine | 6379 | In-memory store (Feast online store + hot cache) |
 | redis-writer | python:3.10-slim (custom) | — | Kafka → Redis + Feast feature push |
 | fastapi-app | python:3.10-slim (custom) | 8000 | REST API + Feast serving + MQTT alerts |
@@ -467,38 +467,44 @@ Section 1 for details on why.
 ### 5.1 Networking
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Docker "pipeline" network                          │
-│                                                     │
-│  kafka ←──→ mqtt-kafka-bridge ←──→ flink-*          │
-│               │                      │              │
-│               │                    delta-writer      │
-│               │                                     │
-└───────────────│─────────────────────────────────────┘
-                │
-                │ extra_hosts: host.docker.internal
-                ▼
-        Remote MQTT Broker (host:1883)
+┌──────────────────────────────────────────────────────────────┐
+│  Docker "pipeline" network                                   │
+│                                                              │
+│  kafka ←──→ mqtt-kafka-bridge ←──→ flink-jobmanager         │
+│    │                                  │                      │
+│    │                          flink-taskmanager              │
+│    │                                  │                      │
+│    │                         flink-delta-writer              │
+│    │                                                         │
+│    ├──→ redis-writer ──→ redis                               │
+│    │                                                         │
+│    └──→ (redis-writer, fastapi-app read from redis)          │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+              │
+              │ MQTT_BROKER: <remote-mqtt-broker>:1883
+              ▼
+      Remote MQTT Broker (AWS)
 
 ┌─────────────────────────────────────────────────────┐
 │  Host network (network_mode: host)                  │
 │                                                     │
-│  sensor-simulator ──→ Local Mosquitto (localhost:1883) │
+│  sensor-simulator ──→ Remote MQTT Broker            │
 └─────────────────────────────────────────────────────┘
 ```
 
 - Services on the `pipeline` network can reach each other by container name
   (e.g., `kafka:9092`, `flink-jobmanager:8081`)
-- `mqtt-kafka-bridge` uses `extra_hosts` to map `host.docker.internal` to the remote MQTT broker
-- `sensor-simulator` uses `network_mode: host` to share the host's network
-  stack directly
+- Both `mqtt-kafka-bridge` and `fastapi-app` connect to the remote MQTT broker (configured via `MQTT_BROKER` env var)
+- `sensor-simulator` uses `network_mode: host` and also points at the remote broker
+- `flink-delta-writer` submits its JAR to `flink-jobmanager:8081` and then exits (the actual job runs on `flink-taskmanager`)
 
 ---
 
 ## 6. How to Run
 
 ```bash
-# Start all services
+# Start all services (flink-delta-writer builds Scala fat JAR on first run — takes ~5 min)
 docker compose up -d
 
 # Watch logs
@@ -507,16 +513,37 @@ docker compose logs -f
 # Check Flink UI
 # Open http://localhost:8081 in browser
 
-# Submit the Flink job
+# Submit the PyFlink processing job
 docker compose exec flink-jobmanager /opt/flink/bin/flink run \
     --python /opt/flink/jobs/fall_detection_job.py
 
-# Verify Delta Lake tables
+# Initialize Feast feature store (must be done once after first start)
+docker compose exec redis-writer bash -c "cd /app/feast_repo && feast apply"
+
+# Restart redis-writer to pick up the Feast registry
+docker compose restart redis-writer
+
+# Verify Delta Lake tables (data appears every ~30 seconds via Scala checkpoints)
 python scripts/query_delta.py
+
+# Verify fall events only
+python scripts/query_delta.py falls
 
 # Stop everything
 docker compose down
 ```
+
+**Running with simulator (no real sensors needed):**
+```bash
+docker compose --profile testing up -d
+```
+The simulator publishes FDS-only data (fall events) by default (`PUBLISH_MODE: "alerts"`).
+OBJ data comes from real sensors. Set `PUBLISH_MODE: "both"` in docker-compose.yml to simulate both.
+
+**Expected state after full startup:**
+- Flink Web UI at `http://localhost:8081` shows **two running jobs**: `Fall Detection Pipeline` (PyFlink) and `Scala Delta Lake Writer`
+- `flink-delta-writer` container shows as **exited (0)** — this is normal (it submitted the JAR and exited)
+- Data appears in Delta Lake tables every ~30 seconds (checkpoint interval)
 
 ---
 
@@ -528,32 +555,56 @@ mqtt-kafka-flink-poc/
 ├── .gitignore
 │
 ├── src/
-│   ├── sensor_simulator/           # Fake data generator
-│   │   ├── simulator.py
+│   ├── sensor_simulator/           # Fake data generator (Docker profile: testing)
+│   │   ├── simulator.py            # Publishes FDS (and optionally OBJ) to MQTT
 │   │   ├── requirements.txt        # paho-mqtt
 │   │   └── Dockerfile
 │   │
 │   ├── mqtt_kafka_bridge/          # MQTT → Kafka forwarder
-│   │   ├── bridge.py
+│   │   ├── bridge.py               # Subscribes to "alerts" + "obj", produces to Kafka
 │   │   ├── requirements.txt        # paho-mqtt, kafka-python-ng
 │   │   └── Dockerfile
 │   │
 │   ├── flink_jobs/                 # PyFlink stream processing
-│   │   ├── fall_detection_job.py
+│   │   ├── fall_detection_job.py   # Reads fds-data + obj-data → writes bronze/silver topics
 │   │   ├── requirements.txt        # apache-flink, apache-flink-libraries
 │   │   └── Dockerfile
 │   │
-│   └── delta_writer/               # Kafka → Delta Lake writer
-│       ├── writer.py
-│       ├── requirements.txt        # kafka-python-ng, deltalake, pyarrow, pandas
-│       └── Dockerfile
+│   ├── flink_delta_writer_scala/   # Scala Flink job — writes Kafka → Delta Lake (DeltaSink)
+│   │   ├── pom.xml                 # Maven build (produces fat JAR)
+│   │   ├── Dockerfile              # Multi-stage: Maven build → flink run submit
+│   │   └── src/main/scala/com/kubocare/delta/
+│   │       ├── DeltaWriterJob.scala         # Main job: 4 Kafka sources → 4 DeltaSinks
+│   │       ├── schemas/
+│   │       │   ├── FdsSchemas.scala         # RowType definitions for FDS tables
+│   │       │   └── ObjSchemas.scala         # RowType definitions for OBJ tables
+│   │       └── parsers/
+│   │           ├── BronzeFdsParser.scala    # JSON → Flink Row (bronze_fds)
+│   │           ├── SilverFdsParser.scala    # JSON → Flink Row (silver_fds)
+│   │           ├── BronzeObjParser.scala    # JSON → Flink Row (bronze_obj)
+│   │           └── SilverObjParser.scala    # JSON → Flink Row (silver_obj)
+│   │
+│   ├── redis_writer/               # Kafka → Redis + Feast feature push
+│   │   ├── writer.py               # Consumes silver-fds + silver-obj, writes Redis + Feast
+│   │   ├── requirements.txt        # kafka-python-ng, redis, feast[redis], pandas
+│   │   └── Dockerfile
+│   │
+│   ├── fastapi_app/                # REST API + Feast serving + MQTT alerts
+│   │   ├── app.py                  # FastAPI endpoints (devices, falls, features, verify-fall)
+│   │   ├── requirements.txt        # fastapi, uvicorn, redis, paho-mqtt, feast[redis], pandas
+│   │   └── Dockerfile
+│   │
+│   └── feast_repo/                 # Feast feature store definitions
+│       ├── features.py             # Feature views: fds_realtime, obj_realtime, fall_history
+│       ├── feature_store.yaml      # Feast config (provider: local, online_store: redis)
+│       └── data/                   # Offline store parquet files (used by feast apply)
 │
 ├── data/
-│   └── delta/                      # Delta Lake tables (Docker volume mount)
-│       ├── bronze_fds/
-│       ├── bronze_obj/
-│       ├── silver_fds/
-│       └── silver_obj/
+│   └── delta/                      # Delta Lake tables (bind-mounted into flink-delta-writer)
+│       ├── bronze_fds/             # Raw FDS events (passthrough)
+│       ├── bronze_obj/             # Raw OBJ events (passthrough)
+│       ├── silver_fds/             # Cleaned FDS (parsed timestamps, split position/report)
+│       └── silver_obj/             # Flattened OBJ (1 row per tracked person)
 │
 ├── scripts/
 │   └── query_delta.py              # Standalone script to read/verify Delta tables
@@ -620,30 +671,36 @@ Source: FDS Source -> FlatMap          Source: OBJ Source -> FlatMap
 
 ## 9. Latency
 
-End-to-end latency is measured by comparing `event_time` (timestamp from the sensor) with `ingestion_time` (when the Delta Writer wrote the row to Delta Lake).
+**Two latency paths exist in this pipeline:**
 
-| Metric | Value |
-|--------|-------|
-| Average | ~1.5s |
-| Median (P50) | ~1.5s |
-| P95 | ~2.0s |
-| P99 | ~2.0s |
+### 9.1 Hot path (MQTT → Redis via redis-writer)
 
-**Where the latency comes from:**
+End-to-end latency for the hot path (Redis queries, FastAPI `/api/devices`, `/api/falls`) is sub-second:
 
 | Stage | Latency |
 |-------|---------|
 | MQTT publish → Kafka receive | < 50ms |
-| Kafka → Flink processing | < 50ms |
-| Flink → Kafka output topics | < 50ms |
-| Kafka output → Delta Writer buffer | < 50ms |
-| Delta Writer buffer flush (FLUSH_INTERVAL=2s) | 0–2000ms |
+| Kafka → PyFlink processing | < 50ms |
+| Flink → Kafka silver topics | < 50ms |
+| Kafka → redis-writer → Redis | < 100ms |
+| **Total** | **< 300ms** |
+
+### 9.2 Cold path (MQTT → Delta Lake via Scala Flink DeltaSink)
+
+End-to-end latency for Delta Lake writes is dominated by the checkpoint interval (30 seconds). DeltaSink buffers data in memory and only flushes a Parquet file + `_delta_log` entry when a Flink checkpoint completes.
+
+| Stage | Latency |
+|-------|---------|
+| MQTT publish → Kafka silver topics | < 200ms |
+| Kafka → Scala Delta Writer buffer | < 50ms |
+| Flink checkpoint interval | 0–30,000ms |
 | Delta Lake write (Parquet + _delta_log) | 200–500ms |
+| **Total** | **~0–30 seconds** |
 
-The dominant cost is the micro-batch flush interval. The Delta Writer accumulates rows for up to 2 seconds before writing — this is necessary because Delta Lake has high per-write overhead (Parquet encoding + transaction log update). Writing one row at a time would be ~100x slower.
+The 30-second checkpoint interval is intentional — DeltaSink requires checkpointing for exactly-once guarantees, and shorter intervals increase overhead without benefit for analytics workloads.
 
-**Why P95/P99 don't go below 1s:**
-Even at `FLUSH_INTERVAL=1`, the Delta Lake write itself takes 200–500ms and the Kafka poll timeout adds up to 1s of wait time. For truly sub-1s latency, a different sink (Redis, Postgres) would be needed for the hot path.
+**Why the hot path exists:**
+For truly real-time queries (sub-second freshness for fall alerts, device status), Delta Lake is too slow. Redis provides the hot cache with 10-minute TTL. The Feast feature store on top of Redis serves pre-computed ML features to the fall verification model in `POST /api/verify-fall`.
 
 ---
 
@@ -656,11 +713,10 @@ Even at `FLUSH_INTERVAL=1`, the Delta Lake write itself takes 200–500ms and th
 | mqtt-kafka-bridge | kafka-python-ng | 2.2.2 | Kafka producer |
 | flink-jobs | apache-flink | 1.18.1 | Stream processing framework |
 | flink-jobs | apache-flink-libraries | 1.18.1 | Flink connector support |
-| delta-writer | kafka-python-ng | 2.2.2 | Kafka consumer |
-| delta-writer | deltalake | 0.22.3 | Delta Lake writer (delta-rs) |
-| delta-writer | pyarrow | >=16 | Columnar data format (required by deltalake) |
-| delta-writer | pandas | 2.2.3 | DataFrame operations for batching |
-
+| flink-delta-writer | delta-flink | 3.2.1 | DeltaSink connector for Flink |
+| flink-delta-writer | delta-standalone_2.12 | 3.2.1 | Delta transaction log reader/writer |
+| flink-delta-writer | flink-connector-kafka | 3.1.0-1.18 | Kafka source for Flink |
+| flink-delta-writer | hadoop-client | 3.3.6 | Hadoop FileSystem API (needed by DeltaSink, provided by Flink image) |
 | redis-writer | kafka-python-ng | 2.2.2 | Kafka consumer |
 | redis-writer | redis | 4.6.0 | Redis client |
 | redis-writer | feast[redis] | 0.40.0 | Feature store (push to online store) |
@@ -739,8 +795,8 @@ Kafka uses the key to decide which partition a message goes to. Same key = same 
 **Key concepts in this pipeline:**
 - **Topics:** `fds-data`, `obj-data` (input) → `bronze-fds`, `silver-fds`, `bronze-obj`, `silver-obj` (output)
 - **Partitions:** Each topic is split into partitions. Flink's TaskManagers read partitions in parallel
-- **Consumer groups:** Flink and delta-writer each have their own group ID, so they read independently without interfering
-- **Offsets:** Kafka tracks how far each consumer has read. If delta-writer crashes, it resumes from its last committed offset — no data loss
+- **Consumer groups:** PyFlink, the Scala Delta Writer, and Redis Writer each have their own group ID, so they read independently without interfering
+- **Offsets:** Kafka tracks how far each consumer has read. If any consumer crashes, it resumes from its last committed offset — no data loss
 
 **KRaft mode (no Zookeeper):**
 Old Kafka needed Zookeeper (a separate cluster coordination service) just to function. KRaft (Kafka Raft) bakes coordination directly into Kafka. One fewer service to manage.
@@ -775,11 +831,11 @@ KafkaSource → map/flatMap (transform) → KafkaSink
 One OBJ message contains multiple people (array). `flat_map` explodes 1 message → N rows (one per person). A regular `map` can only do 1 → 1.
 
 *Why Flink writes back to Kafka (not directly to Delta Lake):*
-PyFlink's dependency (`apache-beam`) requires `pyarrow < 10`. Delta Lake requires `pyarrow >= 16`. Unresolvable conflict. Flink writes to Kafka output topics → separate delta-writer handles Delta Lake. This is a common production pattern anyway.
+PyFlink's dependency (`apache-beam`) requires `pyarrow < 10`. Delta Lake requires `pyarrow >= 16`. Unresolvable conflict. The solution: PyFlink writes to Kafka output topics → a separate Scala Flink job (`flink-delta-writer`) reads those and writes to Delta Lake using `DeltaSink`. This avoids the Python/pyarrow environment entirely. It's also a common production pattern — stream processing and storage writing are naturally separate concerns.
 
 ---
 
-### 11.5 Delta Lake (`delta-writer` + `deltalake` library)
+### 11.5 Delta Lake (Scala `flink-delta-writer` + DeltaSink)
 
 **What it is:** An open table format that sits on top of Parquet files. Adds ACID transactions, schema enforcement, and time travel to plain files.
 
@@ -806,8 +862,14 @@ Gold    →  (not yet built) aggregations: falls per hour, avg velocity per zone
 **Why keep Bronze?**
 If the Silver transformation has a bug, you can re-process from Bronze without going back to re-collect sensor data.
 
-**Micro-batching in delta-writer:**
-Delta Lake isn't designed for single-row writes (massive overhead per write). The writer buffers rows in RAM and flushes every 2 seconds or 25 rows. Each flush = one Parquet file + one `_delta_log` entry.
+**How DeltaSink writes (checkpointing, not micro-batching):**
+DeltaSink is not a micro-batch loop — it integrates with Flink's native checkpointing:
+- Data from Kafka is buffered in Flink's operator state (in-memory)
+- Every 30 seconds a checkpoint fires (configurable via `enableCheckpointing(30_000L)`)
+- On checkpoint completion, DeltaSink atomically writes a Parquet file + a `_delta_log` entry
+- Flink saves Kafka offsets in the checkpoint — crash recovery replays from the last checkpoint offset
+
+This gives **exactly-once** semantics with zero custom polling code.
 
 ---
 
@@ -817,31 +879,35 @@ Delta Lake isn't designed for single-row writes (massive overhead per write). Th
 Radar PCs
     │ MQTT publish (topics: "alerts", "obj")
     ▼
-Mosquitto Broker (host)
+Remote MQTT Broker
     │ paho-mqtt subscribe
     ▼
 MQTT-Kafka Bridge (bridge.py)
     │ KafkaProducer — key=device_id
     ▼
 Kafka (fds-data, obj-data topics)
-    │ KafkaSource — consumer group: flink-fall-detection
+    │ KafkaSource — consumer group: flink-fds-consumer / flink-obj-consumer
     ▼
-Flink (fall_detection_job.py)
+PyFlink (fall_detection_job.py)
     │ ProcessFDS: parse + enrich
     │ ProcessOBJ: parse + flatten per-person
     │ KafkaSink — 4 output topics
     ▼
 Kafka (bronze-fds, silver-fds, bronze-obj, silver-obj)
-    │ KafkaConsumer — consumer group: delta-writer
-    ▼
-Delta Writer (writer.py)
-    │ micro-batch buffer → flush every 2s or 25 rows
-    ▼
-Delta Lake (local filesystem)
-    ├── bronze_fds/   ← raw FDS JSON
-    ├── silver_fds/   ← parsed, is_falling bool
-    ├── bronze_obj/   ← raw OBJ JSON
-    └── silver_obj/   ← one row per tracked person
+    │
+    ├──→ Scala Flink DeltaWriterJob (consumer groups: scala-delta-*)
+    │         │ DeltaSink — checkpoint every 30s → Parquet + _delta_log
+    │         ▼
+    │    Delta Lake (local filesystem)
+    │         ├── bronze_fds/   ← raw FDS JSON
+    │         ├── silver_fds/   ← parsed, is_falling bool
+    │         ├── bronze_obj/   ← raw OBJ JSON
+    │         └── silver_obj/   ← one row per tracked person
+    │
+    └──→ Redis Writer (consumer group: redis-writer)
+              │ write to Redis (TTL 600s) + push to Feast online store
+              ▼
+         Redis + Feast → FastAPI → REST queries + fall verification
 ```
 
 Each component has a single, well-defined responsibility. That's why the system is debuggable — if something breaks, you check one component at a time.
@@ -852,8 +918,8 @@ Each component has a single, well-defined responsibility. That's why the system 
 
 ### 12.1 Why a Hot Path?
 
-The cold path (Delta Writer → Delta Lake) is optimized for durable storage and batch analytics.
-It has ~1.5s write latency and requires scanning Parquet files to answer queries.
+The cold path (Scala Flink DeltaSink → Delta Lake) is optimized for durable storage and batch analytics.
+Data appears every ~30 seconds (checkpoint interval) and requires scanning Parquet files to answer queries.
 This is unsuitable for real-time use cases like:
 - "What is device kc2508p025 doing RIGHT NOW?"
 - "How many people are in room1?"
@@ -868,8 +934,8 @@ and FastAPI (REST API + MQTT alerting) to handle real-time queries.
 Flink → Kafka (silver topics)
               │
               ├──→ Delta Writer → Delta Lake          COLD PATH
-              │    (batch, ~1.5s latency)              Permanent storage, training data
-              │                                        Consumer group: delta-writer
+              │    (~30s checkpoint interval)          Permanent storage, training data
+              │                                        Consumer groups: scala-delta-*
               │
               └──→ Redis Writer → Redis                HOT PATH
                    (streaming, <50ms latency)           10-min TTL, real-time queries
