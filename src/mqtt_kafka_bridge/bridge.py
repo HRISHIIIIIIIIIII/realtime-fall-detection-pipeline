@@ -32,12 +32,12 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 
 # MQTT topics to subscribe to
-MQTT_TOPICS = os.getenv("MQTT_TOPICS", "fds,obj").split(",")
+MQTT_TOPICS = os.getenv("MQTT_TOPICS", "alerts,obj").split(",")
 
 # Mapping: MQTT topic name → Kafka topic name
 # fds → fds-data, obj → obj-data
 TOPIC_MAP = {
-    "fds": "fds-data",
+    "alerts": "fds-data",
     "obj": "obj-data",
 }
 
@@ -85,7 +85,7 @@ def extract_device_id(mqtt_topic, payload):
     """
     try:
         data = json.loads(payload)
-        if mqtt_topic == "fds":
+        if mqtt_topic == "alerts":
             return data.get("board_sn", "unknown")
         elif mqtt_topic == "obj":
             return data.get("board", "unknown")

@@ -16,9 +16,9 @@ format, no subscription required.
 ```
 Multiple PCs (radar sensors)
     │
-    ├── FDS data ──→ Remote MQTT Broker (3.6.75.203)
+    ├── FDS data (topic: "alerts") ──→ Remote MQTT Broker 
     │                        │
-    └── OBJ data ──→ Remote MQTT Broker (3.3.5.3)
+    └── OBJ data (topic: "obj")   ──→ Remote MQTT Broker 
                              │
     ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
     kcsn0010 (this machine)  │  (all services in Docker)
@@ -75,7 +75,7 @@ interested clients SUBSCRIBE to those topics.
 
 **Key concepts:**
 - **Broker**: The central server that routes messages (we use Mosquitto)
-- **Topic**: A string like "sensors/room1/fds" — think of it as a channel
+- **Topic**: A string like "alerts" or "sensors/room1/motion" — think of it as a channel
 - **Publisher**: Sends messages to a topic
 - **Subscriber**: Receives messages from a topic
 - **QoS (Quality of Service)**:
@@ -91,8 +91,8 @@ interested clients SUBSCRIBE to those topics.
 
 **In our pipeline:**
 - Radar sensors on multiple PCs publish FDS and OBJ data to remote MQTT brokers
-- FDS data goes to broker at 3.6.75.203 (topic: "alerts")
-- OBJ data goes to broker at 3.3.5.3 (topic: "obj")
+- FDS data goes to broker (topic: "alerts")
+- OBJ data goes to broker (topic: "obj")
 - The existing Mosquitto broker on kcsn0010 (port 1883) is used by both
   the IoT bridge scripts and the sensor simulator for testing
 
@@ -465,19 +465,18 @@ Section 1 for details on why.
                 │
                 │ extra_hosts: host.docker.internal
                 ▼
-        Host Mosquitto (192.168.29.44:1883)
+        Remote MQTT Broker (host:1883)
 
 ┌─────────────────────────────────────────────────────┐
 │  Host network (network_mode: host)                  │
 │                                                     │
-│  sensor-simulator ──→ Host Mosquitto (localhost:1883)│
+│  sensor-simulator ──→ Local Mosquitto (localhost:1883) │
 └─────────────────────────────────────────────────────┘
 ```
 
 - Services on the `pipeline` network can reach each other by container name
   (e.g., `kafka:9092`, `flink-jobmanager:8081`)
-- `mqtt-kafka-bridge` uses `extra_hosts` to map `host.docker.internal` to
-  the host machine's IP, so it can reach Mosquitto
+- `mqtt-kafka-bridge` uses `extra_hosts` to map `host.docker.internal` to the remote MQTT broker
 - `sensor-simulator` uses `network_mode: host` to share the host's network
   stack directly
 
@@ -687,7 +686,7 @@ IoT devices (radar sensors, wearables) are constrained — low power, unstable c
 **Why not use Kafka directly from the sensor?**
 Kafka's protocol is complex and heavy — not suitable for embedded devices. MQTT is the IoT standard. The bridge translates between worlds.
 
-**In this pipeline:** Radar PCs publish FDS and OBJ data to topics `fds` and `obj` on the remote Mosquitto broker. The local system Mosquitto on kcsn0010 (port 1883) is used for the simulator.
+**In this pipeline:** Radar PCs publish FDS data to topic `alerts` and OBJ data to topic `obj` on the remote Mosquitto broker. The local Mosquitto broker on kcsn0010 (port 1883) is used by the sensor simulator.
 
 ---
 
@@ -803,7 +802,7 @@ Delta Lake isn't designed for single-row writes (massive overhead per write). Th
 
 ```
 Radar PCs
-    │ MQTT publish (fds / obj topics)
+    │ MQTT publish (topics: "alerts", "obj")
     ▼
 Mosquitto Broker (host)
     │ paho-mqtt subscribe

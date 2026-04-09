@@ -87,7 +87,7 @@ services:
       LOCATION: "room1"
       PUBLISH_INTERVAL: "0.5"
       FALL_PROBABILITY: "0.02"
-      PUBLISH_MODE: "fds"
+      PUBLISH_MODE: "alerts"
     restart: unless-stopped
 
   # ============================================================
@@ -121,7 +121,7 @@ services:
       MQTT_BROKER: "34.236.215.53"
       MQTT_PORT: "1883"
       KAFKA_BROKER: "kafka:9092"
-      MQTT_TOPICS: "fds,obj"
+      MQTT_TOPICS: "alerts,obj"
     networks:
       - pipeline
     restart: unless-stopped

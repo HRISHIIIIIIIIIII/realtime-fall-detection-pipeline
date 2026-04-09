@@ -28,7 +28,7 @@ FALL_PROBABILITY = float(os.getenv("FALL_PROBABILITY", "0.02"))
 PUBLISH_MODE = os.getenv("PUBLISH_MODE", "both")
 
 # --- MQTT Topics ---
-FDS_TOPIC = "fds"
+FDS_TOPIC = "alerts"
 OBJ_TOPIC = "obj"
 
 # --- Frame counter (simulates the sensor's sequential frame number) ---
