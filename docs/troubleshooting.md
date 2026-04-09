@@ -348,6 +348,49 @@ If you mix versions, you'll get confusing callback errors.
 
 ---
 
+## 9. PyFlink Job Fails — UnknownTopicOrPartitionException
+
+**Symptom:**
+```
+Caused by: java.lang.RuntimeException: Failed to get metadata for topics [fds-data].
+Caused by: UnknownTopicOrPartitionException: This server does not host this topic-partition.
+```
+
+**Root cause:**
+Flink's `KafkaSourceEnumerator` uses AdminClient to fetch topic partition metadata
+at startup. If the topics don't exist yet, AdminClient throws this error and the
+job fails — even though `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"` is set.
+
+Auto-create only triggers when a *producer* first writes to a topic. The `mqtt-kafka-bridge`
+creates `fds-data` and `obj-data` when it first receives a message, but if you submit
+the PyFlink job before any messages arrive (e.g. on a fresh start), the topics don't
+exist yet.
+
+**Fix:**
+Create the topics explicitly before submitting the PyFlink job:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic fds-data --partitions 1 --replication-factor 1
+
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic obj-data --partitions 1 --replication-factor 1
+```
+
+Then resubmit the job:
+```bash
+docker compose exec flink-jobmanager /opt/flink/bin/flink run \
+    --python /opt/flink/jobs/fall_detection_job.py
+```
+
+**Lesson learned:**
+Always pre-create Kafka topics that stream processing jobs subscribe to.
+Do not rely on auto-creation when consumers start before producers.
+
+---
+
 ## Quick Reference: Useful Debug Commands
 
 ```bash

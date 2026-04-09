@@ -12,8 +12,8 @@ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsIni
 import org.apache.flink.core.fs.Path
 import org.apache.flink.streaming.api.CheckpointingMode
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
+import org.apache.flink.table.data.RowData
 import org.apache.flink.table.types.logical.RowType
-import org.apache.flink.types.Row
 import org.apache.hadoop.conf.Configuration
 
 object DeltaWriterJob {
@@ -35,7 +35,7 @@ object DeltaWriterJob {
     // restarts after a crash, it replays from the saved offset — no data lost,
     // no duplicates.
     // ──────────────────────────────────────────────────────────────────────────
-    env.enableCheckpointing(30_000L, CheckpointingMode.EXACTLY_ONCE)
+    env.enableCheckpointing(30000L, CheckpointingMode.EXACTLY_ONCE)
     env.getCheckpointConfig.setCheckpointStorage(
       "file:///opt/flink/checkpoints/delta-writer"
     )
@@ -89,7 +89,7 @@ object DeltaWriterJob {
     // On first write: creates the table and _delta_log/
     // On subsequent writes: appends new Parquet files + adds a log entry
     // ──────────────────────────────────────────────────────────────────────────
-    def deltaSink(table: String, rowType: RowType): DeltaSink[Row] =
+    def deltaSink(table: String, rowType: RowType): DeltaSink[RowData] =
       DeltaSink
         .forRowData(new Path(s"$DELTA_BASE/$table"), hadoopConf, rowType)
         .build()

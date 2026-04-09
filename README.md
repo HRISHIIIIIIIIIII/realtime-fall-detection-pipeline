@@ -13,14 +13,24 @@ cd realtime-fall-detection-pipeline
 # Note: flink-delta-writer builds the Scala fat JAR on first run (~5 min)
 docker compose up -d
 
-# 3. Submit the PyFlink processing job
+# 3. Create Kafka input topics
+# Must be done before submitting the PyFlink job — Flink's AdminClient checks
+# for topic existence at startup and fails if they don't exist yet.
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic fds-data --partitions 1 --replication-factor 1
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic obj-data --partitions 1 --replication-factor 1
+
+# 4. Submit the PyFlink processing job
 docker compose exec flink-jobmanager /opt/flink/bin/flink run \
     --python /opt/flink/jobs/fall_detection_job.py
 
-# 4. Initialize Feast feature store
+# 5. Initialize Feast feature store
 docker compose exec redis-writer bash -c "cd /app/feast_repo && feast apply"
 
-# 5. Restart redis-writer to pick up Feast registry
+# 6. Restart redis-writer to pick up Feast registry
 docker compose restart redis-writer
 ```
 
@@ -35,14 +45,22 @@ cd realtime-fall-detection-pipeline
 # Note: flink-delta-writer builds the Scala fat JAR on first run (~5 min)
 docker compose --profile testing up -d
 
-# 3. Submit the PyFlink processing job
+# 3. Create Kafka input topics
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic fds-data --partitions 1 --replication-factor 1
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --if-not-exists \
+    --topic obj-data --partitions 1 --replication-factor 1
+
+# 4. Submit the PyFlink processing job
 docker compose exec flink-jobmanager /opt/flink/bin/flink run \
     --python /opt/flink/jobs/fall_detection_job.py
 
-# 4. Initialize Feast feature store
+# 5. Initialize Feast feature store
 docker compose exec redis-writer bash -c "cd /app/feast_repo && feast apply"
 
-# 5. Restart redis-writer to pick up Feast registry
+# 6. Restart redis-writer to pick up Feast registry
 docker compose restart redis-writer
 ```
 

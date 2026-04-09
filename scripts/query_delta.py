@@ -22,9 +22,13 @@ def load_table(name):
     path = os.path.join(BASE_PATH, name)
     if not os.path.exists(os.path.join(path, "_delta_log")):
         return None, None
-    dt = DeltaTable(path)
-    df = dt.to_pandas()
-    return dt, df
+    try:
+        dt = DeltaTable(path)
+        df = dt.to_pandas()
+        return dt, df
+    except Exception as e:
+        print(f"\n  {name}: CORRUPT ({e})")
+        return None, None
 
 
 def show_summary():
